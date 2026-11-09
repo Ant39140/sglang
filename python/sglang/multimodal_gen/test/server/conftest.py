@@ -12,7 +12,7 @@ _PERF_RESULTS = pytest.StashKey[list]()
 def pytest_runtest_makereport(item, call):
     report = (yield).get_result()
     artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
-    if not artifact_dir or (report.when != "call" and report.passed):
+    if not artifact_dir:
         return
 
     error = str(call.excinfo.value) if call.excinfo else ""
@@ -50,7 +50,9 @@ def pytest_runtest_makereport(item, call):
     path = Path(artifact_dir) / "diffusion-test-summary.json"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        records = json.loads(path.read_text()) if path.exists() else []
+        records = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        if not isinstance(records, list):
+            raise ValueError("Expected a list of test results")
         records.append(record)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
