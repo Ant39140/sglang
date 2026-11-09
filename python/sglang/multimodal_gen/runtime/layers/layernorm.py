@@ -127,7 +127,9 @@ class RMSNorm(CustomOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE") or (
+            preserve_residual_rounding and current_platform.is_out_of_tree()
+        ):
             self._forward_method = self.forward_native
         elif USE_AITER:
             self._forward_method = self.forward_aiter
