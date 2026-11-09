@@ -34,6 +34,7 @@ import contextlib
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 # ============================================================
@@ -478,6 +479,57 @@ def _format_metric(metrics, thresholds, metric_key, threshold_key):
     return f"{value} (threshold {threshold})"
 
 
+def _observed_outcomes(records):
+    """Count final testcase outcomes, keeping artifacts and pytest phases distinct."""
+    outcomes = {}
+    priority = {"unknown": 0, "passed": 1, "skipped": 2, "failed": 3}
+    for record in records:
+        key = (record["artifact"], normalize_test_path(record["testcase"]))
+        status = record.get("status", "unknown")
+        if status == "passed" and record.get("phase") != "call":
+            status = "unknown"
+        if priority.get(status, 0) >= priority[outcomes.get(key, "unknown")]:
+            outcomes[key] = status if status in priority else "unknown"
+    return Counter(outcomes.values())
+
+
+def _performance_measurements(error):
+    """Adapt the CI bot's named assertion parsing without mixing metrics or units."""
+    headers = list(re.finditer(r"Validation failed for ['\"]([^'\"]+)['\"]", error))
+    units = {
+        "ms": ("time", 0.001),
+        "s": ("time", 1),
+        "MiB": ("memory", 1),
+        "GiB": ("memory", 1024),
+    }
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    measurements = []
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(error)
+        block = error[header.end() : end]
+        values = {}
+        unit = None
+        for key, label in (
+            ("actual", "Actual"),
+            ("baseline", "Expected"),
+            ("limit", "Limit"),
+        ):
+            match = re.search(rf"\b{label}:\s*({number})[ \t]*(ms|s|MiB|GiB)\b", block)
+            if not match:
+                continue
+            if unit is None:
+                unit = match[2]
+            if units[match[2]][0] == units[unit][0]:
+                values[key] = float(match[1]) * units[match[2]][1] / units[unit][1]
+        if "actual" in values:
+            measurements.append({"metric": header[1], "unit": unit, **values})
+    return measurements
+
+
+def _table_cell(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
 def generate_report(
     failed,
     recommended,
@@ -499,6 +551,32 @@ def generate_report(
     out = []
     out.append("# Test Failure vs Recommendation Report")
     out.append("")
+    out.extend(["## Summary", "", f"- **Failure entries:** {len(failed)}."])
+    outcomes = _observed_outcomes(diffusion_results or [])
+    if outcomes:
+        out.append(
+            "- **Observed diffusion testcase outcomes:** "
+            f"✅ {outcomes['passed']} passed; ❌ {outcomes['failed']} failed; "
+            f"⏭️ {outcomes['skipped']} skipped; ❔ {outcomes['unknown']} unknown."
+        )
+        out.append(
+            "  Counts use final testcase outcomes within each artifact. "
+            "Missing artifacts and unrecorded tests are not counted."
+        )
+    else:
+        out.append(
+            "- **Diffusion testcase execution:** no structured outcomes available."
+        )
+    if recommended:
+        out.append(
+            f"- **Recommendations:** {len(hit)} failure entries matched; "
+            f"{len(miss)} did not. Matching does not identify the cause."
+        )
+    else:
+        out.append(
+            "- **Coverage comparison:** unavailable; no recommendations provided."
+        )
+    out.append("")
     out.append(f"**Log source**: `{log_dir}`")
     out.append("")
     if job_results:
@@ -511,7 +589,7 @@ def generate_report(
                 job, diffusion_results, log_dir
             ):
                 out.append(
-                    f"> **Missing diagnostics:** `{job}` failed without a failed-test "
+                    f"> **Missing diagnostics:** `{job}` failed without failed-test "
                     "details. Check job logs for setup, collection, or runner errors."
                 )
                 out.append("")
@@ -526,6 +604,22 @@ def generate_report(
     test_failures = [r for r in diffusion_results or [] if r.get("status") == "failed"]
     if test_failures:
         out.extend(["## Diffusion Test Failures", ""])
+        out.extend(["| Testcase | Phase | Error | Artifact |", "|---|---|---|---|"])
+        for record in test_failures:
+            out.append(
+                "| "
+                + " | ".join(
+                    _table_cell(value)
+                    for value in (
+                        record["testcase"].rsplit("::", 1)[-1],
+                        record.get("phase") or "unknown",
+                        record.get("error_type") or "unknown",
+                        record["artifact"],
+                    )
+                )
+                + " |"
+            )
+        out.append("")
         for record in test_failures:
             out.append(f"### `{record['testcase']}`")
             out.append("")
@@ -534,17 +628,59 @@ def generate_report(
                 f"artifact: `{record['artifact']}`"
             )
             out.append("")
-            out.append(
-                f"Actual: {record.get('actual')}; baseline: {record.get('baseline')}; "
-                f"threshold: {record.get('threshold')}"
-            )
+            measurements = _performance_measurements(record.get("error") or "")
+            if measurements:
+                out.extend(
+                    [
+                        "| Metric | Actual | Baseline | Limit | Change vs baseline |",
+                        "|---|---|---|---|---|",
+                    ]
+                )
+                for measurement in measurements:
+                    baseline = measurement.get("baseline")
+                    change = (
+                        f"{(measurement['actual'] / baseline - 1) * 100:+.1f}%"
+                        if baseline is not None and baseline > 0
+                        else "n/a"
+                    )
+                    values = [
+                        f"{measurement[key]:g} {measurement['unit']}"
+                        if key in measurement
+                        else "n/a"
+                        for key in ("actual", "baseline", "limit")
+                    ]
+                    out.append(
+                        f"| {_table_cell(measurement['metric'])} | "
+                        + " | ".join([*values, change])
+                        + " |"
+                    )
+                out.extend(
+                    [
+                        "",
+                        "Changes are measured against the baseline; limits may also "
+                        "include an absolute allowance. They do not establish a root cause.",
+                    ]
+                )
+            elif any(
+                record.get(key) is not None
+                for key in ("actual", "baseline", "threshold")
+            ):
+                out.append(
+                    f"Actual: {record.get('actual')}; baseline: {record.get('baseline')}; "
+                    f"threshold: {record.get('threshold')} (units unavailable)"
+                )
             if url := record.get("job_url") or record.get("run_url"):
                 out.extend(["", f"[Source run/job]({url})"])
             # Indentation keeps arbitrary exception messages inside a code block.
             out.extend(
                 [
                     "",
+                    "<details>",
+                    "<summary>Full error</summary>",
+                    "",
                     *("    " + line for line in record.get("error", "").splitlines()),
+                    "",
+                    "</details>",
                     "",
                 ]
             )
