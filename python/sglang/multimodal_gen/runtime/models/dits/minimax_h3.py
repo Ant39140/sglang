@@ -406,12 +406,8 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(
-    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
-) -> nn.RMSNorm | RMSNorm:
-    if current_platform.is_npu():
-        return RMSNorm(size, eps=eps).to(dtype=dtype)
-    return nn.RMSNorm(size, eps=eps, dtype=dtype)
+def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
+    return RMSNorm(size, eps=eps).to(dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -421,7 +417,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm | RMSNorm,
+    norm: RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -536,8 +532,8 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm | RMSNorm,
-    k_norm: nn.RMSNorm | RMSNorm,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
@@ -668,8 +664,8 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm | RMSNorm,
-    k_norm: nn.RMSNorm | RMSNorm,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -1837,11 +1833,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        if current_platform.is_npu():
-            h, x = self.norm2(h, x)
-        else:
-            x = x + h
-            h = self.norm2(x)
+        h, x = self.norm2(h, x)
         return x + self.mlp(h)
 
 
