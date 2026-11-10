@@ -60,7 +60,7 @@ if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
-    import torch_npu  # noqa: F401  # Registers NPU operators.
+    import torch_npu
     from sgl_kernel_npu.norm.rmsnorm_without_weight import (
         fused_rmsnorm_without_weight,
     )
@@ -107,6 +107,13 @@ class RMSNorm(CustomOp):
 
     Computes x -> w * x / sqrt(E[x^2] + eps) where w is the learned weight.
     Refer to https://arxiv.org/abs/1910.07467
+
+    ``preserve_residual_rounding`` keeps residual addition separate from the
+    norm so low-precision inputs round before normalization. It also selects
+    PyTorch's reference RMSNorm on non-NPU platforms, including OOT plugins.
+    NPU inputs still use the native operator when supported, so normalization
+    itself is not guaranteed to be bit-exact with PyTorch. When false, backends
+    may fuse residual addition and normalization.
     """
 
     def __init__(
@@ -274,15 +281,29 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        from sglang.srt.hardware_backend.npu.layernorm import NPURMSNorm
+        eps = self.variance_epsilon
+        if eps is None:
+            eps = torch.finfo(x.dtype).eps
+        if residual is not None:
+            if self.preserve_residual_rounding:
+                x = residual = residual + x
+            else:
+                out, _, residual_out = torch_npu.npu_add_rms_norm(
+                    residual, x, self.weight.data, eps
+                )
+                return out, residual_out
 
-        return NPURMSNorm()._apply_norm(
-            x,
-            self.weight.data,
-            self.variance_epsilon,
-            residual,
-            preserve_residual_rounding=self.preserve_residual_rounding,
-        )
+        if self.preserve_residual_rounding and (
+            x.dtype not in (torch.float16, torch.bfloat16)
+            or self.weight.dtype != x.dtype
+            or self.weight.device != x.device
+            or x.numel() == 0
+            or not hasattr(torch.ops.npu, "npu_rms_norm")
+        ):
+            out = F.rms_norm(x, (self.hidden_size,), self.weight.data, eps)
+        else:
+            out = torch_npu.npu_rms_norm(x, self.weight.data, eps)[0]
+        return out if residual is None else (out, residual)
 
     def forward_hip(
         self,
