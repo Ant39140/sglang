@@ -407,15 +407,11 @@ def _copy_grouped_qkv_tp_shard(
 
 
 def _norm(
-    size: int,
-    *,
-    eps: float,
-    dtype: torch.dtype = _BF16_DTYPE,
-    preserve_residual_rounding: bool = True,
-) -> RMSNorm:
-    return RMSNorm(
-        size, eps=eps, preserve_residual_rounding=preserve_residual_rounding
-    ).to(dtype=dtype)
+    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
+) -> nn.RMSNorm | RMSNorm:
+    if current_platform.is_npu():
+        return RMSNorm(size, eps=eps).to(dtype=dtype)
+    return nn.RMSNorm(size, eps=eps, dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -425,7 +421,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: RMSNorm,
+    norm: nn.RMSNorm | RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -540,8 +536,8 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
@@ -672,8 +668,8 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -1814,11 +1810,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
-        self.norm2 = _norm(
-            arch.hidden_size,
-            eps=arch.norm_eps,
-            preserve_residual_rounding=not current_platform.is_npu(),
-        )
+        self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The whole dynamic text-refiner/scatter phase is one BCG break point;
         # do not nest per-attention graph breaks inside it.
         self.attn = MiniMaxH3Attention(
@@ -1845,7 +1837,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        h, x = self.norm2(h, x)
+        if current_platform.is_npu():
+            h, x = self.norm2(h, x)
+        else:
+            x = x + h
+            h = self.norm2(x)
         return x + self.mlp(h)
 
 

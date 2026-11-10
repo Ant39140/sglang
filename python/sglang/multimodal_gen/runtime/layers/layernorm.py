@@ -107,13 +107,6 @@ class RMSNorm(CustomOp):
 
     Computes x -> w * x / sqrt(E[x^2] + eps) where w is the learned weight.
     Refer to https://arxiv.org/abs/1910.07467
-
-    ``preserve_residual_rounding`` keeps residual addition separate from the
-    norm so low-precision inputs round before normalization. It also selects
-    PyTorch's reference RMSNorm on non-NPU platforms, including OOT plugins.
-    NPU inputs still use the native operator when supported, so normalization
-    itself is not guaranteed to be bit-exact with PyTorch. When false, backends
-    may fuse residual addition and normalization.
     """
 
     def __init__(
@@ -123,20 +116,16 @@ class RMSNorm(CustomOp):
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        preserve_residual_rounding: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.cast_x_before_out_mul = cast_x_before_out_mul
-        self.preserve_residual_rounding = preserve_residual_rounding
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE") or (
-            preserve_residual_rounding and current_platform.is_out_of_tree()
-        ):
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
         elif USE_AITER:
             self._forward_method = self.forward_aiter
@@ -155,8 +144,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.preserve_residual_rounding:
-            return self.forward_native(x, residual)
         shape = x.shape
         if self.cast_x_before_out_mul:
             if residual is not None or self.variance_size_override is not None:
@@ -212,11 +199,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.preserve_residual_rounding:
-            if residual is not None:
-                x = residual = residual + x
-            out = F.rms_norm(x, (self.hidden_size,), self.weight, self.variance_epsilon)
-            return out if residual is None else (out, residual)
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = x.dtype
@@ -281,29 +263,12 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        eps = self.variance_epsilon
-        if eps is None:
-            eps = torch.finfo(x.dtype).eps
         if residual is not None:
-            if self.preserve_residual_rounding:
-                x = residual = residual + x
-            else:
-                out, _, residual_out = torch_npu.npu_add_rms_norm(
-                    residual, x, self.weight.data, eps
-                )
-                return out, residual_out
-
-        if self.preserve_residual_rounding and (
-            x.dtype not in (torch.float16, torch.bfloat16)
-            or self.weight.dtype != x.dtype
-            or self.weight.device != x.device
-            or x.numel() == 0
-            or not hasattr(torch.ops.npu, "npu_rms_norm")
-        ):
-            out = F.rms_norm(x, (self.hidden_size,), self.weight.data, eps)
-        else:
-            out = torch_npu.npu_rms_norm(x, self.weight.data, eps)[0]
-        return out if residual is None else (out, residual)
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
+        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_hip(
         self,
@@ -318,8 +283,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.preserve_residual_rounding:
-            return self.forward_native(x, residual)
         # Fall back to the native fp32 path for cases aiter cannot serve:
         #   - fp32 input  (CK kernel is templated on fp16/bf16 only;
         #                  out.dtype check rejects fp32 with "not support output type: float")
@@ -372,8 +335,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.preserve_residual_rounding:
-            return self.forward_native(x, residual)
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -402,8 +363,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.preserve_residual_rounding:
-            return self.forward_native(x, residual)
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
