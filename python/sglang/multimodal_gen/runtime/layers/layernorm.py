@@ -130,10 +130,6 @@ class RMSNorm(CustomOp):
         elif USE_AITER:
             self._forward_method = self.forward_aiter
 
-    @property
-    def eps(self) -> float:
-        return self.variance_epsilon
-
     def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         return rms_norm_fn(
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
