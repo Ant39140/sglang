@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -517,8 +518,6 @@ def _modulate_gate(
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
-    if hidden.device.type == "npu" and hidden.dtype in (torch.float16, torch.bfloat16):
-        return torch.ops.npu.npu_swiglu(hidden)
     if (
         hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
@@ -1713,6 +1712,7 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        self._npu_swiglu = SiluAndMul() if current_platform.is_npu() else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1731,7 +1731,13 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if self._npu_swiglu is not None and hidden.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            hidden = self._npu_swiglu(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 

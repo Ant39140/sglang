@@ -1696,6 +1696,26 @@ These are individual end-to-end measurements for each topology, not averages.
 The eight-NPU topology had 46.8% lower end-to-end latency than the four-NPU
 topology.
 
+### Ascend two-NPU CI timing
+
+A November 10, 2026 [CI run](https://github.com/sgl-project/sglang/actions/runs/42807237864/job/129800765118)
+at revision `670ad6573e` measured MiniMax-H3 FL2VA T2VA in BF16 on two Ascend
+A3 NPUs, using TP2 + SP1, Laser Attention, the Cache-DiT settings from the
+Ascend launch commands, a resident DiT, and text-encoder layerwise offload.
+The request used the cat-band prompt, seed 1101, 50 inference steps, and a
+five-second video at 1344×768. Torch compile and breakable CUDA graph were
+disabled.
+
+| End-to-end generation | Denoising | Decoding | Mean denoising step | Median denoising step |
+| ---: | ---: | ---: | ---: | ---: |
+| **139.57 s** | 128.54 s | 10.35 s | 2570.20 ms | 546.04 ms |
+
+Generation latency excludes model loading: loading took 325.42 s, and the
+load-inclusive total was 464.99 s. These are timings from one CI run; its
+image consistency check failed (SSIM 0.7530, PSNR 23.10 dB), so generation
+quality still needs review. The zeroed memory counters provide no memory
+measurement. The four- and eight-NPU measurements above use separate runs.
+
 ### B300 precision and encoder placement
 
 A 12-configuration sweep on a single 8× B300 host, covering both checkpoint
