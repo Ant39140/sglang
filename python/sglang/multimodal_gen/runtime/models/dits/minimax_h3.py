@@ -405,8 +405,16 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
-    return RMSNorm(size, eps=eps, preserve_residual_rounding=True).to(dtype=dtype)
+def _norm(
+    size: int,
+    *,
+    eps: float,
+    dtype: torch.dtype = _BF16_DTYPE,
+    preserve_residual_rounding: bool = True,
+) -> RMSNorm:
+    return RMSNorm(
+        size, eps=eps, preserve_residual_rounding=preserve_residual_rounding
+    ).to(dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -509,6 +517,8 @@ def _modulate_gate(
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+    if hidden.device.type == "npu" and hidden.dtype in (torch.float16, torch.bfloat16):
+        return torch.ops.npu.npu_swiglu(hidden)
     if (
         hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
@@ -1798,7 +1808,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
-        self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
+        self.norm2 = _norm(
+            arch.hidden_size,
+            eps=arch.norm_eps,
+            preserve_residual_rounding=not current_platform.is_npu(),
+        )
         # The whole dynamic text-refiner/scatter phase is one BCG break point;
         # do not nest per-attention graph breaks inside it.
         self.attn = MiniMaxH3Attention(
@@ -1818,15 +1832,15 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        x = x + self.attn(
+        h = self.attn(
             self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        x = x + self.mlp(self.norm2(x))
-        return x
+        h, x = self.norm2(h, x)
+        return x + self.mlp(h)
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
